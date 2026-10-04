@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gorofa Payment Sync & Download</title>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+</head>
+<body style="font-family:sans-serif;padding:20px;max-width:560px;margin:0 auto;">
+<h2>Gorofa Payment App</h2>
+<div id="cloudStatus" style="font-weight:bold;margin:10px 0;">🔌 Connecting...</div>
+
+<div id="loginScreen" style="display:none;border:1px solid #ccc;padding:15px;border-radius:5px;">
+<h3>Sign In</h3>
+<form id="loginForm" onsubmit="doLogin(event)">
+<input type="email" id="loginUser" placeholder="Email" autocomplete="username" style="width:100%;margin-bottom:8px;box-sizing:border-box;">
+<input type="password" id="loginPass" placeholder="Password" autocomplete="current-password" style="width:100%;margin-bottom:8px;box-sizing:border-box;">
+<button type="submit">Log In</button>
+<button type="button" onclick="createAccount()">Register</button>
+</form>
+<div id="loginError" style="color:red;margin-top:10px;"></div>
+</div>
+
+<div id="appScreen" style="display:none;border:1px solid #ccc;padding:15px;border-radius:5px;">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+<div style="font-size:13px;color:#555;">Signed in as <strong id="userEmail"></strong></div>
+<button onclick="logout()">Log Out</button>
+</div>
+
+<form onsubmit="addPayment(event)" style="border-top:1px solid #eee;padding-top:10px;">
+<input id="payName" placeholder="Name" required style="width:100%;margin-bottom:6px;box-sizing:border-box;">
+<input id="payAmount" type="number" step="0.01" min="0" placeholder="Amount" required style="width:100%;margin-bottom:6px;box-sizing:border-box;">
+<input id="payNote" placeholder="Note (optional)" style="width:100%;margin-bottom:6px;box-sizing:border-box;">
+<button type="submit" id="addBtn">➕ Add Payment</button>
+</form>
+
+<h4 style="margin:14px 0 4px;">Shared payments</h4>
+<ul id="payList" style="list-style:none;padding:0;margin:0;"></ul>
+
+<div style="margin-top:14px;">
+<button onclick="downloadLocalDataAsFile()">💾 Download JSON</button>
+</div>
+</div>
+
+<script>
+const APP_SOURCE_HTML = "<!DOCTYPE html>\\n" + document.documentElement.outerHTML;
+
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDVBZgQp2u5Awb4O6K1SM9gB6Y-0NpB0GA",
+  authDomain: "gorafa-payment.firebaseapp.com",
+  projectId: "gorafa-payment",
+  storageBucket: "gorafa-payment.firebasestorage.app",
+  messagingSenderId: "646663554381",
+  appId: "1:646663554381:web:c01ad62ad06a10d71b6304"
+};
+
+if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+
+const auth = firebase.auth();
+const dbCloud = firebase.firestore();
+const cloudRef = dbCloud.collection("gorofa").doc("sharedData");
+
+let db = {payments:[]};
+let cloudUnsubscribe = null;
+let writing = false;
+
+function updateCloudStatus(msg){
+  document.getElementById("cloudStatus").textContent = msg;
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g,c=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+function makeId(){
+  return Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+}
+
+function render(){
+  const list=document.getElementById("payList");
+  const payments=Array.isArray(db.payments)?db.payments:[];
+  if(!payments.length){
+    list.innerHTML='<li style="color:#888;padding:8px 0;">No payments yet. Add one above.</li>';
+    return;
+  }
+  const sorted=[...payments].sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+  list.innerHTML=sorted.map(p=>{
+    const amt=Number(p.amount);
+    const amtStr=isFinite(amt)?amt.toFixed(2):"?";
+    const when=p.createdAt?new Date(p.createdAt).toLocaleString():"";
+    const by=p.by?escapeHtml(p.by):"";
+    const meta=[by,when].filter(Boolean).join(" · ");
+    return `<li style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:8px 0;border-bottom:1px solid #eee;">
+      <div style="flex:1;">
+        <div><strong>${escapeHtml(p.name||"")}</strong> — KSh ${amtStr}</div>
+        ${p.note?`<div style="font-size:12px;color:#666;">${escapeHtml(p.note)}</div>`:""}
+        ${meta?`<div style="font-size:11px;color:#999;">${meta}</div>`:""}
+      </div>
+      <button data-delete="${escapeHtml(p.id||"")}" title="Delete"
+        style="background:#e33;color:#fff;border:none;border-radius:3px;padding:4px 8px;cursor:pointer;">✕</button>
+    </li>`;
+  }).join("");
+}
+
+document.getElementById("payList").addEventListener("click",e=>{
+  const btn=e.target.closest("[data-delete]");
+  if(btn) deletePayment(btn.dataset.delete);
+});
+
+async function doLogin(e){
+  e.preventDefault();
+  const errEl=document.getElementById("loginError");
+  errEl.textContent="";
+  const email=document.getElementById("loginUser").value.trim();
+  const password=document.getElementById("loginPass").value;
+  if(!email||!password){errEl.textContent="Email and password required.";return;}
+  try{
+    await auth.signInWithEmailAndPassword(email,password);
+    document.getElementById("loginPass").value="";
+  }catch(err){errEl.textContent=err.message;}
+}
+
+async function createAccount(){
+  const email=prompt("Email:");
+  if(!email)return;
+  const password=prompt("Password (min 6 characters):");
+  if(!password)return;
+  try{
+    await auth.createUserWithEmailAndPassword(email.trim(),password);
+  }catch(err){alert(err.message);}
+}
+
+function logout(){auth.signOut();}
+
+auth.onAuthStateChanged(user=>{
+  document.getElementById("loginScreen").style.display=user?"none":"block";
+  document.getElementById("appScreen").style.display=user?"block":"none";
+  if(user){
+    document.getElementById("userEmail").textContent=user.email||user.uid;
+    startFirebaseSync();
+  }else{
+    if(cloudUnsubscribe){cloudUnsubscribe();cloudUnsubscribe=null;}
+    db={payments:[]};
+    render();
+    updateCloudStatus("🔐 Signed out");
+  }
+});
+
+function startFirebaseSync(){
+  if(cloudUnsubscribe)cloudUnsubscribe();
+  updateCloudStatus("🔄 Syncing...");
+  cloudUnsubscribe=cloudRef.onSnapshot(snapshot=>{
+    if(!snapshot.exists){
+      db={payments:[]};
+      updateCloudStatus("☁️ Live (empty)");
+    }else{
+      const data=snapshot.data()||{};
+      db={...data};
+      if(!Array.isArray(db.payments))db.payments=[];
+      updateCloudStatus("☁️ Live & Synced");
+    }
+    render();
+  },err=>{
+    updateCloudStatus("⚠️ "+err.message);
+  });
+}
+
+async function addPayment(e){
+  e.preventDefault();
+  if(writing||!auth.currentUser)return;
+  const nameEl=document.getElementById("payName");
+  const amtEl=document.getElementById("payAmount");
+  const noteEl=document.getElementById("payNote");
+  const name=nameEl.value.trim();
+  const amount=parseFloat(amtEl.value);
+  const note=noteEl.value.trim();
+  if(!name)return alert("Name required.");
+  if(!isFinite(amount))return alert("Valid amount required.");
+
+  const entry={
+    id:makeId(),
+    name,
+    amount:Math.round(amount*100)/100,
+    note:note||"",
+    createdAt:Date.now(),
+    by:auth.currentUser.email||auth.currentUser.uid
+  };
+
+  writing=true;
+  const addBtn=document.getElementById("addBtn");
+  addBtn.disabled=true;
+  try{
+    updateCloudStatus("📤 Saving...");
+    await cloudRef.set(
+      {payments:firebase.firestore.FieldValue.arrayUnion(entry)},
+      {merge:true}
+    );
+    nameEl.value="";
+    amtEl.value="";
+    noteEl.value="";
+    nameEl.focus();
+  }catch(err){
+    alert("Save failed: "+err.message);
+    updateCloudStatus("⚠️ "+err.message);
+  }finally{
+    writing=false;
+    addBtn.disabled=false;
+  }
+}
+
+async function deletePayment(id){
+  if(!id||writing||!auth.currentUser)return;
+  const payments=Array.isArray(db.payments)?db.payments:[];
+  const entry=payments.find(p=>p.id===id);
+  if(!entry)return;
+  if(!confirm(`Delete payment "${entry.name}"?`))return;
+
+  writing=true;
+  try{
+    updateCloudStatus("📤 Saving...");
+    await cloudRef.set(
+      {payments:firebase.firestore.FieldValue.arrayRemove(entry)},
+      {merge:true}
+    );
+  }catch(err){
+    alert("Delete failed: "+err.message);
+    updateCloudStatus("⚠️ "+err.message);
+  }finally{
+    writing=false;
+  }
+}
+
+function saveBlob(filename,content,mimeType){
+  try{
+    const blob=new Blob([content],{type:mimeType||"application/octet-stream"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;
+    a.download=filename;
+    a.rel="noopener";
+    a.style.display="none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url),2000);
+  }catch(err){alert("Download failed: "+err.message);}
+}
+
+function timestamp(){
+  const d=new Date(),p=n=>String(n).padStart(2,"0");
+  return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+
+    "_"+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds());
+}
+
+function downloadLocalDataAsFile(){
+  if(!db||!Array.isArray(db.payments)||!db.payments.length){
+    if(!confirm("No synced payments yet.\nDownload an empty file anyway?"))return;
+  }
+  saveBlob(
+    "gorofa_data_"+timestamp()+".json",
+    JSON.stringify(db,null,2),
+    "application/json"
+  );
+}
+
+render();
+</script>
+</body>
+</html>
